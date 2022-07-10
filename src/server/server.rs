@@ -268,6 +268,22 @@ impl<I, E> Builder<I, E> {
         self
     }
 
+    /// Set whether HTTP/1 connections should support mid-message
+    /// End-of-file detection.
+    ///
+    /// After reading the request headers and body, and before a response
+    /// is ready, hyper will `read` from the socket once more to make sure 
+    /// it has registered interest in case the socket ever hangs up. Set
+    /// this to `false` to avoid this extra `read`.
+    ///
+    /// Default is `true`.
+    #[cfg(feature = "http1")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+    pub fn http1_mid_message_eof_detection(mut self, val: bool) -> Self {
+        self.protocol.http1_mid_message_eof_detection(val);
+        self
+    }
+
     /// Set the maximum buffer size.
     ///
     /// Default is ~ 400kb.

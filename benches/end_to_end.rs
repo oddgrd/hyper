@@ -191,6 +191,7 @@ fn http2_parallel_x10_res_10mb(b: &mut test::Bencher) {
 // ==== Benchmark Options =====
 
 struct Opts {
+    http1_mid_message_eof_detection: bool,
     http2: bool,
     http2_stream_window: Option<u32>,
     http2_conn_window: Option<u32>,
@@ -204,6 +205,7 @@ struct Opts {
 
 fn opts() -> Opts {
     Opts {
+        http1_mid_message_eof_detection: true,
         http2: false,
         http2_stream_window: None,
         http2_conn_window: None,
@@ -360,6 +362,7 @@ fn spawn_server(rt: &tokio::runtime::Runtime, opts: &Opts) -> SocketAddr {
     let body = opts.response_body;
     let srv = rt.block_on(async move {
         Server::bind(&addr)
+            .http1_mid_message_eof_detection(opts.http1_mid_message_eof_detection)
             .http2_only(opts.http2)
             .http2_initial_stream_window_size(opts.http2_stream_window)
             .http2_initial_connection_window_size(opts.http2_conn_window)
