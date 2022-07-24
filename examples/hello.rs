@@ -24,7 +24,9 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let addr = ([127, 0, 0, 1], 3000).into();
 
-    let server = Server::bind(&addr).serve(make_svc);
+    let server = Server::bind(&addr)
+        .http1_mid_message_eof_detection(false)
+        .serve(make_svc);
 
     println!("Listening on http://{}", addr);
 
