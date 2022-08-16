@@ -291,10 +291,7 @@ impl Opts {
 
         let addr = spawn_server(&rt, &self);
 
-        let client_count = match self.http2 {
-            true => 1,
-            false => self.parallel_cnt,
-        };
+        let client_count = if self.http2 { 1 } else { self.parallel_cnt };
 
         let mut request_senders: Vec<SendRequest<crate::Body>> = (0..client_count)
             .map(|_| prepare_client(&rt, &self, &addr))
@@ -312,48 +309,47 @@ impl Opts {
             }
         };
 
+        let uri: hyper::Uri = format!("http://{}/hello", addr).parse().unwrap();
+        let make_request = || {
+            let chunk_cnt = self.request_chunks;
+            let body = if chunk_cnt > 0 {
+                let (mut tx, body) = Body::channel();
+                let chunk = self
+                    .request_body
+                    .expect("request_chunks means request_body");
+                rt.spawn(async move {
+                    for _ in 0..chunk_cnt {
+                        tx.send_data(chunk.into()).await.expect("send_data");
+                    }
+                });
+                body
+            } else {
+                self.request_body
+                    .map(Body::from)
+                    .unwrap_or_else(Body::empty)
+            };
+            let mut req = Request::new(body);
+            *req.method_mut() = self.request_method.clone();
+            *req.uri_mut() = uri.clone();
+            req
+        };
+
         if self.parallel_cnt == 1 {
             b.iter(|| {
-                let req = make_request(&self, &rt, &addr);
+                let req = make_request();
                 rt.block_on(send_request(req, 0));
             });
         } else {
             b.iter(|| {
                 let futs = (0..self.parallel_cnt as usize).map(|idx| {
                     let i = if self.http2 { 0 } else { idx };
-                    let req = make_request(&self, &rt, &addr);
+                    let req = make_request();
                     send_request(req, i)
                 });
                 rt.spawn(join_all(futs));
             });
         }
     }
-}
-
-/// Creates a request, for being sent via the request_sender
-fn make_request(opts: &Opts, rt: &tokio::runtime::Runtime, addr: &SocketAddr) -> Request<Body> {
-    let url: hyper::Uri = format!("http://{}/hello", addr).parse().unwrap();
-    let chunk_cnt = opts.request_chunks;
-    let body = if chunk_cnt > 0 {
-        let (mut tx, body) = Body::channel();
-        let chunk = opts
-            .request_body
-            .expect("request_chunks means request_body");
-        rt.spawn(async move {
-            for _ in 0..chunk_cnt {
-                tx.send_data(chunk.into()).await.expect("send_data");
-            }
-        });
-        body
-    } else {
-        opts.request_body
-            .map(Body::from)
-            .unwrap_or_else(Body::empty)
-    };
-    let mut req = Request::new(body);
-    *req.method_mut() = opts.request_method.clone();
-    *req.uri_mut() = url.clone();
-    req
 }
 
 /// Prepares a client (request_sender) for sending requests to the given address
@@ -385,7 +381,7 @@ fn prepare_client(
 /// Spawns a server in the background
 fn spawn_server(rt: &tokio::runtime::Runtime, opts: &Opts) -> SocketAddr {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let tcp_listener = rt.block_on(async move { TcpListener::bind(addr).await.unwrap() });
+    let tcp_listener = rt.block_on(TcpListener::bind(addr)).unwrap();
     let local_addr = tcp_listener.local_addr().unwrap();
 
     let opts = opts.clone();
@@ -393,7 +389,6 @@ fn spawn_server(rt: &tokio::runtime::Runtime, opts: &Opts) -> SocketAddr {
     rt.spawn(async move {
         loop {
             let (stream, _addr) = tcp_listener.accept().await.unwrap();
-            eprintln!("New incoming connection: {:?}", addr);
             tokio::task::spawn(
                 Http::new()
                     .http2_only(opts.http2)
