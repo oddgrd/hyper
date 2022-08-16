@@ -6,16 +6,14 @@ use test::Bencher;
 
 use futures_util::future::join_all;
 use hyper::body::HttpBody;
-use hyper::client::conn::{Builder, SendRequest};
+use hyper::client::conn::SendRequest;
 use hyper::{server::conn::Http, service::service_fn};
 use hyper::{Body, Method, Request, Response};
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-//use tower::ServiceExt;
+use tower::ServiceExt;
 
 // // HTTP1
 #[bench]
@@ -196,6 +194,7 @@ fn http2_parallel_x10_res_10mb(b: &mut test::Bencher) {
 
 // // ==== Benchmark Options =====
 
+#[derive(Clone)]
 struct Opts {
     http2: bool,
     http2_stream_window: Option<u32>,
@@ -292,22 +291,19 @@ impl Opts {
 
         let addr = spawn_server(&rt, &self);
 
-        match self.http2 {
-            true => self.bench_http2(b, &rt, &addr),
-            false => self.bench_http1(b, &rt, &addr),
+        let client_count = match self.http2 {
+            true => 1,
+            false => self.parallel_cnt,
         };
-    }
 
-    //
-    // Benches http/1 requests
-    //
-    fn bench_http1(self, b: &mut test::Bencher, rt: &tokio::runtime::Runtime, addr: &SocketAddr) {
-        //Open n connections to the server,
-        let mut request_senders: Vec<SendRequest<crate::Body>> = (0..self.parallel_cnt)
+        let mut request_senders: Vec<SendRequest<crate::Body>> = (0..client_count)
             .map(|_| prepare_client(&rt, &self, &addr))
             .collect();
 
         let mut send_request = |req: Request<Body>, idx: usize| {
+            if self.http2 {
+                rt.block_on(request_senders[idx].ready()).unwrap();
+            }
             let fut = request_senders[idx].send_request(req);
             async {
                 let res = fut.await.expect("Client wait");
@@ -323,58 +319,18 @@ impl Opts {
             });
         } else {
             b.iter(|| {
-                //in each iter, we are going to send one request with each of the request senders
                 let futs = (0..self.parallel_cnt as usize).map(|idx| {
+                    let i = if self.http2 { 0 } else { idx };
                     let req = make_request(&self, &rt, &addr);
-                    send_request(req, idx)
+                    send_request(req, i)
                 });
-                rt.block_on(join_all(futs));
-            });
-        }
-    }
-
-    //
-    // Benches http/2 requests
-    //
-    fn bench_http2(&self, b: &mut test::Bencher, rt: &tokio::runtime::Runtime, addr: &SocketAddr) {
-        //open just one connection, and send all the requests via that connection
-        let request_sender = Arc::new(Mutex::new(prepare_client(rt, &self, addr)));
-        let send_request = |req: Request<Body>| {
-            let mut _sender = Arc::clone(&request_sender);
-            async move {
-                let res = _sender
-                    .lock()
-                    .await
-                    .send_request(req)
-                    .await
-                    .expect("Client wait");
-
-                let mut body = res.into_body();
-                while let Some(_chunk) = body.data().await {}
-            }
-        };
-
-        if self.parallel_cnt == 1 {
-            b.iter(|| {
-                let req = make_request(&self, &rt, &addr);
-                rt.block_on(send_request(req));
-            });
-        } else {
-            b.iter(|| {
-                let futs = (0..self.parallel_cnt).map(|_| {
-                    let req = make_request(&self, &rt, &addr);
-                    send_request(req)
-                });
-
-                rt.block_on(join_all(futs));
+                rt.spawn(join_all(futs));
             });
         }
     }
 }
 
-//
-// Creates a request, for being sent via the request_sender
-//
+/// Creates a request, for being sent via the request_sender
 fn make_request(opts: &Opts, rt: &tokio::runtime::Runtime, addr: &SocketAddr) -> Request<Body> {
     let url: hyper::Uri = format!("http://{}/hello", addr).parse().unwrap();
     let chunk_cnt = opts.request_chunks;
@@ -400,73 +356,60 @@ fn make_request(opts: &Opts, rt: &tokio::runtime::Runtime, addr: &SocketAddr) ->
     req
 }
 
-//
-// Prepares a client (request_sender) for sending requests to the given addr
-//
+/// Prepares a client (request_sender) for sending requests to the given address
 fn prepare_client(
     rt: &tokio::runtime::Runtime,
     opts: &Opts,
     addr: &SocketAddr,
 ) -> SendRequest<crate::Body> {
-    let mut builder = Builder::new();
-    builder
-        .http2_only(opts.http2)
-        .http2_initial_stream_window_size(opts.http2_stream_window)
-        .http2_initial_connection_window_size(opts.http2_conn_window)
-        .http2_adaptive_window(opts.http2_adaptive_window);
+    let target_stream = rt.block_on(TcpStream::connect(addr)).unwrap();
+    let (client, conn) = rt
+        .block_on(
+            hyper::client::conn::Builder::new()
+                .http2_only(opts.http2)
+                .http2_initial_stream_window_size(opts.http2_stream_window)
+                .http2_initial_connection_window_size(opts.http2_conn_window)
+                .http2_adaptive_window(opts.http2_adaptive_window)
+                .handshake::<_, Body>(target_stream),
+        )
+        .unwrap();
 
-    let (request_sender, connection) = rt.block_on(async move {
-        let target_stream = TcpStream::connect(addr).await.unwrap();
-
-        builder.handshake(target_stream).await.unwrap()
-    });
     rt.spawn(async move {
-        if let Err(e) = connection.await {
-            panic!("Error in connection: {}", e);
+        if let Err(e) = conn.await {
+            eprintln!("Error in connection: {}", e);
         }
     });
-    request_sender
+    client
 }
 
-//
-// Spawns a server in the background
-//
+/// Spawns a server in the background
 fn spawn_server(rt: &tokio::runtime::Runtime, opts: &Opts) -> SocketAddr {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let tcp_listener = rt.block_on(async move { TcpListener::bind(addr).await.unwrap() });
     let local_addr = tcp_listener.local_addr().unwrap();
-    let mut http = Http::new();
-    //configure http based on opts
-    http.http2_only(opts.http2)
-        .http2_initial_stream_window_size(opts.http2_stream_window)
-        .http2_initial_connection_window_size(opts.http2_conn_window)
-        .http2_adaptive_window(opts.http2_adaptive_window);
 
-    let (http2, http2_stream_window, http2_conn_window, http2_adaptive_window) = (
-        opts.http2,
-        opts.http2_stream_window,
-        opts.http2_conn_window,
-        opts.http2_adaptive_window,
-    );
+    let opts = opts.clone();
+    let body = opts.response_body;
     rt.spawn(async move {
         loop {
-            let (tcp_stream, addr) = tcp_listener.accept().await.unwrap();
+            let (stream, _addr) = tcp_listener.accept().await.unwrap();
             eprintln!("New incoming connection: {:?}", addr);
             tokio::task::spawn(
                 Http::new()
-                    .http2_only(http2)
-                    .http2_initial_stream_window_size(http2_stream_window)
-                    .http2_initial_connection_window_size(http2_conn_window)
-                    .http2_adaptive_window(http2_adaptive_window)
-                    .serve_connection(tcp_stream, service_fn(handle_request)),
+                    .http2_only(opts.http2)
+                    .http2_initial_stream_window_size(opts.http2_stream_window)
+                    .http2_initial_connection_window_size(opts.http2_conn_window)
+                    .http2_adaptive_window(opts.http2_adaptive_window)
+                    .serve_connection(
+                        stream,
+                        service_fn(move |req: Request<Body>| async move {
+                            let mut req_body = req.into_body();
+                            while let Some(_chunk) = req_body.data().await {}
+                            Ok::<_, hyper::Error>(Response::new(Body::from(body)))
+                        }),
+                    ),
             );
         }
     });
     local_addr
-}
-
-async fn handle_request(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    let mut req_body = _req.into_body();
-    while let Some(_) = req_body.data().await {}
-    Ok::<Response<Body>, Infallible>(Response::new(Body::from(req_body)))
 }
