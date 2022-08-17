@@ -293,21 +293,9 @@ impl Opts {
 
         let client_count = if self.http2 { 1 } else { self.parallel_cnt };
 
-        let mut request_senders: Vec<SendRequest<crate::Body>> = (0..client_count)
+        let mut request_senders: Vec<SendRequest<Body>> = (0..client_count)
             .map(|_| prepare_client(&rt, &self, &addr))
             .collect();
-
-        let mut send_request = |req: Request<Body>, idx: usize| {
-            if self.http2 {
-                rt.block_on(request_senders[idx].ready()).unwrap();
-            }
-            let fut = request_senders[idx].send_request(req);
-            async {
-                let res = fut.await.expect("Client wait");
-                let mut body = res.into_body();
-                while let Some(_chunk) = body.data().await {}
-            }
-        };
 
         let uri: hyper::Uri = format!("http://{}/hello", addr).parse().unwrap();
         let make_request = || {
@@ -334,6 +322,19 @@ impl Opts {
             req
         };
 
+        let mut send_request = |req: Request<Body>, idx: usize| {
+            let fut = rt.block_on(async {
+                let sender = request_senders[idx].ready().await.unwrap();
+                sender.send_request(req)
+            });
+
+            async {
+                let res = fut.await.expect("Client wait");
+                let mut body = res.into_body();
+                while let Some(_chunk) = body.data().await {}
+            }
+        };
+
         if self.parallel_cnt == 1 {
             b.iter(|| {
                 let req = make_request();
@@ -346,7 +347,8 @@ impl Opts {
                     let req = make_request();
                     send_request(req, i)
                 });
-                rt.spawn(join_all(futs));
+
+                rt.block_on(join_all(futs));
             });
         }
     }
@@ -357,9 +359,9 @@ fn prepare_client(
     rt: &tokio::runtime::Runtime,
     opts: &Opts,
     addr: &SocketAddr,
-) -> SendRequest<crate::Body> {
+) -> SendRequest<Body> {
     let target_stream = rt.block_on(TcpStream::connect(addr)).unwrap();
-    let (client, conn) = rt
+    let (client, connection) = rt
         .block_on(
             hyper::client::conn::Builder::new()
                 .http2_only(opts.http2)
@@ -371,10 +373,11 @@ fn prepare_client(
         .unwrap();
 
     rt.spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("Error in connection: {}", e);
+        if let Err(e) = connection.await {
+            panic!("Error in connection: {}", e);
         }
     });
+
     client
 }
 
